@@ -117,9 +117,12 @@ BLOCK = """\
     provider: auto
     auto_hotword: true
     auto_completion: true
-    auto_wait_ms: 220
-    weak_quality: 1.5
+    auto_wait_ms: 160
+    weak_quality: 1.8
     wait_min_length: 4
+    max_auto_waits: 2
+    prefetch: true
+    warmup: true
     auto_known: false
     timeout_ms: 1200
     # Sogou's hostname is filtered by some ISPs.  Current public IPs are used

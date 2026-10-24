@@ -13,7 +13,7 @@ local DEFAULTS = {
   max_candidates = 6,
   auto_hotword = true,
   auto_completion = true,
-  auto_wait_ms = 220,
+  auto_wait_ms = 160,
   manual_wait_ms = 1500,
   timeout_ms = 1200,
   insert_after = 3,
@@ -30,8 +30,11 @@ local DEFAULTS = {
   cache_ttl = 600,
   negative_ttl = 30,
   hint_position = 3,
-  weak_quality = 1.5,             -- wait for cloud when the best local match is weak
-  wait_min_length = 4,            -- don't add latency to 1-3 letter prefixes
+  weak_quality = 1.8,             -- wait for cloud when the best local match is weak
+  wait_min_length = 4,            -- don't add latency to very short prefixes
+  max_auto_waits = 2,             -- hard cap on blocking waits per composition
+  prefetch = true,                -- speculatively fetch the predicted next input
+  warmup = true,                  -- open HTTP(S) connections on first keystroke
   auto_known = false,             -- also fetch cloud hints for strong local matches
 }
 
@@ -95,6 +98,9 @@ function M.load(env)
     if ok and type(v) == "number" then c.weak_quality = v end
   end
   c.wait_min_length = read_int(cfg, "wait_min_length", DEFAULTS.wait_min_length)
+  c.max_auto_waits = read_int(cfg, "max_auto_waits", DEFAULTS.max_auto_waits)
+  c.prefetch = read_bool(cfg, "prefetch", DEFAULTS.prefetch)
+  c.warmup = read_bool(cfg, "warmup", DEFAULTS.warmup)
   c.auto_known = read_bool(cfg, "auto_known", DEFAULTS.auto_known)
   c.trigger_key = read_string(cfg, "trigger_key", DEFAULTS.trigger_key)
   c.pinyin_mode = read_string(cfg, "pinyin_mode", DEFAULTS.pinyin_mode)

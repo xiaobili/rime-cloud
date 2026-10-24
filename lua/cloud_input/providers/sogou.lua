@@ -34,6 +34,7 @@ function M.build(pinyin, cfg)
     url = cfg.sogou_url,
     body = payload(pinyin),
     timeout_ms = cfg.timeout_ms,
+    lane = 1,
     headers = {
       "Content-Type: application/octet-stream",
       "Accept: */*",

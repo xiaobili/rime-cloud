@@ -21,6 +21,7 @@ local cache = {}          -- ckey -> {expire_ms, results}
 local pending = {}        -- ckey -> {provider, pinyin, started_ms}
 local failure_until = {}  -- provider -> monotonic ms
 local last_auto_key = {}  -- provider -> ckey
+local warmed = false
 local order_of_kind = { hot = 1, completion = 2, fuzzy = 3 }
 local order_of_provider = { sogou = 1, baidu = 2 }
 
@@ -179,6 +180,34 @@ end
 -- Query cloud candidates for `pinyin`.
 -- opts = { manual = bool, wait_ms = number }
 -- Returns a list of {text=..., kind=..., provider=...}.
+-- Open the provider connections before the first real query.  Only a HEAD is
+-- sent (no pinyin), so this does not leak any input; it removes the TLS
+-- handshake from the first candidate page.
+function M.warmup(cfg)
+  if warmed then return end
+  -- The pure-Lua fallback performs synchronous curl calls; never block init.
+  if not http.using_c then return end
+  warmed = true
+  local baidu_base = cfg.baidu_url:match("^(https?://[^/]+)")
+  if baidu_base then
+    http.submit("warmup|baidu", {
+      url = baidu_base .. "/", method = "HEAD", timeout_ms = 2000, lane = 0,
+      headers = { "Accept: */*" },
+    })
+  end
+  local sogou_base = cfg.sogou_url:match("^(https?://[^/]+)")
+  if sogou_base then
+    local opts = {
+      url = sogou_base .. "/", method = "HEAD", timeout_ms = 2000, lane = 1,
+      headers = { "Accept: */*" },
+      resolve = (#(cfg.sogou_resolve or {}) > 0) and cfg.sogou_resolve or nil,
+      doh_url = (cfg.sogou_doh ~= "" and cfg.sogou_doh) or nil,
+    }
+    http.submit("warmup|sogou", opts)
+  end
+  log.log(cfg, "warmup started")
+end
+
 function M.lookup(pinyin, cfg, opts)
   opts = opts or {}
   local manual = opts.manual == true
@@ -279,6 +308,25 @@ function M.lookup(pinyin, cfg, opts)
     log.log(cfg, "no cloud candidates for %s (manual)", pinyin)
   end
   return merged
+end
+
+-- Speculative prefetch: submit queries without waiting and without touching
+-- the "current input" cancellation keys.  The result is picked up by a later
+-- lookup for the same pinyin (or discarded by cancel_keys).
+function M.prefetch(pinyin, cfg, names)
+  local keys = {}
+  for _, name in ipairs(names or { "baidu" }) do
+    local _, _, key = start(name, pinyin, cfg, false)
+    if key then keys[#keys + 1] = key end
+  end
+  return keys
+end
+
+function M.cancel_keys(keys)
+  for _, key in ipairs(keys or {}) do
+    http.cancel(key)
+    pending[key] = nil
+  end
 end
 
 function M.stats()

@@ -41,7 +41,11 @@
 #define MAX_TIMEOUT_MS 15000L
 #define DEFAULT_MAX_SIZE (256 * 1024)
 #define MAX_QUEUE 16
-#define WORKER_COUNT 4
+/* Lanes keep provider connections sticky: lane 0 = Baidu, lane 1 = Sogou.
+ * One persistent libcurl handle per lane means TLS/DNS/HTTP keep-alive is
+ * reused for every query of that provider, which is what makes the first
+ * candidate page fast. */
+#define LANE_COUNT 2
 #define RESULT_BUCKETS 127
 #define RESULT_GC_AGE 300 /* seconds */
 
@@ -76,8 +80,15 @@ typedef struct result_t {
 typedef struct job_t {
   request_t req;
   result_t *res;
+  int lane;
   struct job_t *next;
 } job_t;
+
+typedef struct {
+  job_t *head;
+  job_t *tail;
+  size_t len;
+} lane_t;
 
 typedef struct {
   char *data;
@@ -89,14 +100,12 @@ typedef struct {
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t g_workers[WORKER_COUNT];
+static pthread_t g_workers[LANE_COUNT];
 static int g_worker_started = 0;
 static int g_worker_count = 0;
 static int g_stop = 0;
 
-static job_t *g_queue_head = NULL;
-static job_t *g_queue_tail = NULL;
-static size_t g_queue_len = 0;
+static lane_t g_lanes[LANE_COUNT];
 
 static result_t *g_results[RESULT_BUCKETS];
 static size_t g_result_count = 0;
@@ -352,24 +361,25 @@ static void result_publish_locked(result_t *res, const http_response_t *resp) {
 }
 
 static void *worker_main(void *arg) {
-  (void)arg;
+  int lane = (int)(intptr_t)arg;
+  lane_t *q = &g_lanes[lane];
   CURL *curl = curl_easy_init();
   if (!curl)
     return NULL;
 
   for (;;) {
     pthread_mutex_lock(&g_mutex);
-    while (!g_queue_head && !g_stop)
+    while (!q->head && !g_stop)
       pthread_cond_wait(&g_cond, &g_mutex);
-    if (!g_queue_head) {
+    if (!q->head) {
       pthread_mutex_unlock(&g_mutex);
       break;
     }
-    job_t *job = g_queue_head;
-    g_queue_head = job->next;
-    if (!g_queue_head)
-      g_queue_tail = NULL;
-    g_queue_len--;
+    job_t *job = q->head;
+    q->head = job->next;
+    if (!q->head)
+      q->tail = NULL;
+    q->len--;
     pthread_mutex_unlock(&g_mutex);
 
     http_response_t resp;
@@ -408,8 +418,9 @@ static void start_worker(void) {
   if (!g_worker_started) {
     g_stop = 0;
     g_worker_count = 0;
-    for (int i = 0; i < WORKER_COUNT; ++i) {
-      if (pthread_create(&g_workers[g_worker_count], NULL, worker_main, NULL) == 0)
+    for (int i = 0; i < LANE_COUNT; ++i) {
+      if (pthread_create(&g_workers[g_worker_count], NULL, worker_main,
+                         (void *)(intptr_t)i) == 0)
         g_worker_count++;
     }
     g_worker_started = g_worker_count > 0;
@@ -422,7 +433,10 @@ static void start_worker(void) {
  * module out from under a running curl request. */
 static void stop_workers(void) {
   pthread_mutex_lock(&g_mutex);
-  if (!g_worker_started && !g_queue_head) {
+  int any = g_worker_started;
+  for (int i = 0; i < LANE_COUNT; ++i)
+    if (g_lanes[i].head) any = 1;
+  if (!any) {
     pthread_mutex_unlock(&g_mutex);
     return;
   }
@@ -434,10 +448,17 @@ static void stop_workers(void) {
       r->cancelled = 1;
   }
 
-  /* Drop everything still queued. */
-  job_t *jobs = g_queue_head;
-  g_queue_head = g_queue_tail = NULL;
-  g_queue_len = 0;
+  /* Detach all queued jobs from every lane. */
+  job_t *jobs = NULL;
+  job_t **tail = &jobs;
+  for (int i = 0; i < LANE_COUNT; ++i) {
+    if (g_lanes[i].head) {
+      *tail = g_lanes[i].head;
+      while (*tail) tail = &(*tail)->next;
+    }
+    g_lanes[i].head = g_lanes[i].tail = NULL;
+    g_lanes[i].len = 0;
+  }
   pthread_cond_broadcast(&g_cond);
   pthread_mutex_unlock(&g_mutex);
 
@@ -609,6 +630,19 @@ static int l_request(lua_State *L) {
   return 2;
 }
 
+static int request_lane(lua_State *L, int idx) {
+  int lane = 0;
+  if (lua_istable(L, idx)) {
+    lua_getfield(L, idx, "lane");
+    if (!lua_isnil(L, -1))
+      lane = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+  }
+  if (lane < 0 || lane >= LANE_COUNT)
+    lane = 0;
+  return lane;
+}
+
 static int l_submit(lua_State *L) {
   ensure_curl();
   const char *key = luaL_checkstring(L, 1);
@@ -618,6 +652,7 @@ static int l_submit(lua_State *L) {
 
   request_t req;
   parse_request(L, 2, &req);
+  int lane = request_lane(L, 2);
   start_worker();
 
   pthread_mutex_lock(&g_mutex);
@@ -630,7 +665,7 @@ static int l_submit(lua_State *L) {
     (void)done;
     return 1;
   }
-  if (g_queue_len >= MAX_QUEUE) {
+  if (g_lanes[lane].len >= MAX_QUEUE) {
     pthread_mutex_unlock(&g_mutex);
     request_free(&req);
     lua_pushinteger(L, -1);
@@ -657,14 +692,17 @@ static int l_submit(lua_State *L) {
     req.key = xstrdup(key);
   job->req = req;
   job->res = res;
+  job->lane = lane;
 
-  if (g_queue_tail)
-    g_queue_tail->next = job;
+  lane_t *q = &g_lanes[lane];
+  if (q->tail)
+    q->tail->next = job;
   else
-    g_queue_head = job;
-  g_queue_tail = job;
-  g_queue_len++;
-  pthread_cond_signal(&g_cond);
+    q->head = job;
+  q->tail = job;
+  q->len++;
+  /* Wake both lanes: a single signal could wake the wrong worker. */
+  pthread_cond_broadcast(&g_cond);
   pthread_mutex_unlock(&g_mutex);
 
   lua_pushinteger(L, 1);
@@ -738,21 +776,24 @@ static int l_cancel(lua_State *L) {
 
   pthread_mutex_lock(&g_mutex);
 
-  /* If the job has not started yet, remove it from the queue entirely. */
+  /* If the job has not started yet, remove it from its lane queue. */
   job_t *removed_job = NULL;
-  job_t *prev = NULL;
-  job_t **pp = &g_queue_head;
-  while (*pp) {
-    if (strcmp((*pp)->req.key, key) == 0) {
-      removed_job = *pp;
-      *pp = removed_job->next;
-      if (g_queue_tail == removed_job)
-        g_queue_tail = prev;
-      g_queue_len--;
-      break;
+  for (int lane = 0; lane < LANE_COUNT && !removed_job; ++lane) {
+    lane_t *q = &g_lanes[lane];
+    job_t *prev = NULL;
+    job_t **pp = &q->head;
+    while (*pp) {
+      if (strcmp((*pp)->req.key, key) == 0) {
+        removed_job = *pp;
+        *pp = removed_job->next;
+        if (q->tail == removed_job)
+          q->tail = prev;
+        q->len--;
+        break;
+      }
+      prev = *pp;
+      pp = &(*pp)->next;
     }
-    prev = *pp;
-    pp = &(*pp)->next;
   }
 
   result_t *doomed = NULL;
@@ -874,9 +915,18 @@ static int l_now_ms(lua_State *L) {
 static int l_stats(lua_State *L) {
   pthread_mutex_lock(&g_mutex);
   results_gc_locked();
+  size_t total = 0;
+  for (int i = 0; i < LANE_COUNT; ++i)
+    total += g_lanes[i].len;
   lua_newtable(L);
-  lua_pushinteger(L, (lua_Integer)g_queue_len);
+  lua_pushinteger(L, (lua_Integer)total);
   lua_setfield(L, -2, "queue");
+  lua_newtable(L);
+  for (int i = 0; i < LANE_COUNT; ++i) {
+    lua_pushinteger(L, (lua_Integer)g_lanes[i].len);
+    lua_rawseti(L, -2, i + 1);
+  }
+  lua_setfield(L, -2, "lanes");
   lua_pushinteger(L, (lua_Integer)g_result_count);
   lua_setfield(L, -2, "results");
   lua_pushboolean(L, g_worker_started);

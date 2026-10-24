@@ -3,7 +3,7 @@
 在 Arch Linux + Hyprland + fcitx5-rime 下，为 Rime 增加两类云输入能力：
 
 - **🔥 热门词提示**：本地词库只有「瓦砾困」这类无意义匹配时，自动把搜狗/百度云端的热门词、人名、新词补进候选列表。
-- **✨ 自动联想补全**：把 `nsdd`、`awsl`、`srds` 这类缩写自动补全为「你说的对」「啊我死了」「虽然都是」等完整表达；也支持整段拼音的云端补全。
+- **✨ 自动联想补全**：把缩写/简拼自动补全为完整表达（如 `qwer` → 曲蔚然）；如果本地词库已经能给出同样的缩写展开（如 `nsdd` → 你说的对），则不再阻塞等待云端，按 `Ctrl+t` 可强制查询云端候选。
 
 插件直接工作在 librime 内部，因此所有 Rime 前端（fcitx5-rime、ibus-rime、小狼毫、鼠须管）都能用；本仓库以 fcitx5-rime 为主要目标。
 
@@ -15,12 +15,12 @@
   4. 瓦力困        🔥百
   5. 瓦理论        🔥百
 
-输入 nsdd
-  1. 你说得对
-  2. 纳税地点
-  3. 南山大道
-  4. 你说的对      ✨百
-  5. 你是对的人
+输入 qwer
+  1. 气味儿
+  2. 七五二
+  3. 秦婉儿
+  4. 曲蔚然        ✨百
+  5. 犬瘟热        ✨百
 
 输入 nsdd 后按 Ctrl+t（手动触发）
   1. 你说的对      ✨百
@@ -127,9 +127,12 @@ patch:
     provider: auto          # auto | sogou | baidu
     auto_hotword: true      # 自动热门词
     auto_completion: true   # 自动联想补全
-    auto_wait_ms: 220       # 本地候选弱时，最多等云端多久（毫秒）
-    weak_quality: 1.5       # 本地最佳候选低于此质量才自动等待云端
-    wait_min_length: 4      # 短于 4 个字母不等待，避免打字卡顿
+    auto_wait_ms: 160       # 只在“完整拼音/缩写”边界最多等多久（毫秒）
+    max_auto_waits: 2       # 单次组字最多阻塞几次，防止逐键卡顿
+    prefetch: true          # 预取预测的下一个输入（降低最终候选等待）
+    warmup: true            # 首次按键时预热 HTTP(S) 连接（只发 HEAD，不带拼音）
+    weak_quality: 1.8       # 本地最佳候选低于此质量才自动等待云端
+    wait_min_length: 4      # 短于 4 个字母不等待
     auto_known: false       # true = 本地已有好词时也后台预取云候选
     timeout_ms: 1200        # 单次网络请求超时
     max_candidates: 6       # 最多展示几个云候选
@@ -219,7 +222,7 @@ Rime 输入
   ├─ lua_translator@*cloud_input*translator
   │    1. 询问主翻译器：本地是否有覆盖整段的候选？候选质量多少？
   │    2. 本地匹配强 → 不等待云端，零延迟
-  │       本地匹配弱/无 → 提交异步请求，最多等 auto_wait_ms
+  │       本地匹配弱/无 → 只在完整拼音/缩写边界等待（受 max_auto_waits 限制）
   │    3. 云候选打上 cloud_<auto|manual>_<hot|completion|fuzzy>_<provider> 类型
   ├─ lua_filter@*cloud_input*filter（挂在 uniquifier 之后）
   │    1. 去重（本地已有的词不再重复显示）
@@ -229,14 +232,29 @@ Rime 输入
        捕获 Ctrl+t，刷新一次组句，走 manual 查询
 ```
 
-C 模块 `cloud_http.so` 用一个持久 libcurl 句柄保持连接和 DNS 缓存，并用后台 worker 并发请求搜狗/百度；Lua 侧只做非阻塞的结果收割。没有 C 模块时自动退回 `curl` 子进程。
+C 模块 `cloud_http.so` 为百度、搜狗各保留一条 libcurl 长连接通道（lane），另有预测预取通道；每个 lane 使用独立 worker 和持久连接，复用 TLS/HTTP keep-alive。Lua 侧只做非阻塞的结果收割。没有 C 模块时自动退回 `curl` 子进程。
 
 ### 延迟设计
 
+早期版本在**每个前缀**上都同步等云端，输入 `walikun` 时会在 `waliku`、`walikun` 各卡约 180ms。现在改为：
+
+- **只在可能的词边界等待**：完整拼音的终止音节（`walikun` 的 `kun`）或缩写（`nsdd`），中间前缀（`waliku`、`walik`）不阻塞。
+- **每轮组字最多阻塞 `max_auto_waits` 次**（默认 2），避免逐键累积延迟。
+- **预测预取**：输入 `waliku` 时推测下一个可能是 `walikun`，提前查百度；如果猜中，最终候选直接从缓存命中，通常 0–30ms 返回。
+- **中间前缀快速路径**：不完整拼音不额外查询主翻译器，省掉每键 5–20ms 的字典开销。
 - 本地已经有高质量匹配（如「你好」）：**不联网、不等待**。
-- 本地只有弱匹配（如「瓦砾困」）：最多等 `auto_wait_ms`，一般百度 80–150ms 内返回。
-- 缩写/生僻人名：等待一次换来候选；之后同拼音命中缓存。
+- 缩写（无拼音音节结构）无法预测；如果本地词库已经有相同首字母的展开（`nsdd` → 你说得对），不阻塞，只在后台补缓存；否则会有一次约 80–160ms 的等待。可把 `auto_wait_ms` 调到 `0` 或按 `Ctrl+t` 手动触发。
 - 手动 `Ctrl+t`：等待上限 `manual_wait_ms`（默认 1500ms），同时查搜狗和百度。
+
+如果仍然觉得卡顿，优先尝试：
+
+```yaml
+  cloud_input:
+    auto_wait_ms: 0        # 自动模式完全不阻塞；候选在下次刷新/手动触发时出现
+    # 或
+    max_auto_waits: 1
+    prefetch: true
+```
 
 ---
 
@@ -277,7 +295,7 @@ RIME_USER_DIR=~/.local/share/fcitx5/rime ./tests/rime_dump rime_ice 'nsdd|'   # 
 | 完全没有云候选 | 确认 `rime_deployer --build` 成功；`debug: true` 看日志；确认 `librime-lua.so` 存在 |
 | 日志里 `http_c=false` | C 模块没加载（Lua ABI 不匹配或未编译），会走 curl fallback；检查 `ldd lua/cloud_input/cloud_http.so` |
 | 搜狗一直失败、只有百度 | 搜狗 IP 失效：运行 `scripts/update-sogou-ips.sh` 更新 `sogou_ips` |
-| 打字卡顿 | 调低 `auto_wait_ms`、调高 `weak_quality`、把 `auto_known` 保持 `false`；或关掉自动模式只用 `Ctrl+t` |
+| 打字卡顿 | 保持 `prefetch: true`；把 `max_auto_waits` 调到 1、`auto_wait_ms` 调到 0；或只用 `Ctrl+t` 手动触发 |
 | 手动键无效 | 换一个不冲突的 `trigger_key`；`fcitx5-remote -r` 后重试 |
 | 更新配置不生效 | `rime_deployer --build ~/.local/share/fcitx5/rime /usr/share/rime-data`，重启 fcitx5 |
 | 双拼查错词 | 设置 `pinyin_mode: hints` 并确认 `translator/spelling_hints` 已开启 |
@@ -297,6 +315,8 @@ RIME_USER_DIR=~/.local/share/fcitx5/rime ./tests/rime_dump rime_ice 'nsdd|'   # 
 ## 隐私
 
 - 发送内容：当前组字的**拼音字母**（以及云源要求的分隔信息），不含已上屏文字。
+- 预测预取开启时（默认开启），还会发送一个**推测的下一个拼音组合**；它只是拼音，不含任何已上屏文本。可在配置里设 `prefetch: false` 关闭。
+- 连接预热（`warmup: true`）会在插件初始化时向云源发一个 **HEAD 请求**（不带拼音、不含输入内容），以提前建立 TLS/HTTP 连接；可在配置里关闭。
 - 不发送：应用名、窗口标题、剪贴板、按键历史、文件内容。
 - 缓存只在内存；进程退出即消失。
 - 完全关闭网络：`auto_hotword: false`、`auto_completion: false`，且不按手动触发键。

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static RimeApi *api;
 
@@ -25,6 +26,7 @@ static void print_context(RimeSessionId session, const char *label) {
 int main(int argc, char **argv) {
   const char *schema = argc > 1 ? argv[1] : "rime_ice";
   const char *keys = argc > 2 ? argv[2] : "nihao";
+  int delay_ms = argc > 3 ? atoi(argv[3]) : 0;
   const char *userdir = getenv("RIME_USER_DIR");
   static char fallback[4096];
   if (!userdir) {
@@ -60,6 +62,10 @@ int main(int argc, char **argv) {
     else if (ch == '|') api->process_key(session, 't', 1 << 2); /* Control+t */
     else if (ch == '\n') continue;
     else api->process_key(session, ch, 0);
+    if (delay_ms > 0) {
+      struct timespec req = { delay_ms / 1000, (delay_ms % 1000) * 1000000L };
+      nanosleep(&req, NULL);
+    }
   }
   print_context(session, "after keys");
 

@@ -28,10 +28,39 @@ local manager = require("cloud_input.manager")
 local log = require("cloud_input.log")
 local util = require("cloud_input.util")
 local http = require("cloud_input.http")
+local syllables = require("cloud_input.syllables")
 
 local M = {}
 
 local main_translator_cache = {}
+
+-- Per-composition blocking budget.  A long pinyin string is translated once
+-- per keystroke; waiting on the network for every prefix is what makes typing
+-- feel laggy.  Keep the cloud-induced latency bounded and make it
+-- configurable via cloud_input/max_auto_waits.
+local wait_state = { input = "", count = 0, last_ms = 0, last_wait_input = "" }
+
+-- Speculative next-letter prefetch: while a pinyin syllable is incomplete
+-- ("waliku"), ask for the most likely completed word ("walikun") ahead of the
+-- next keystroke.  If the guess is right, the final candidate page is served
+-- from cache instead of stalling on the network.
+local prefetch_state = { pinyin = "", keys = {} }
+
+local function speculative_prefetch(input, cfg)
+  local predicted = syllables.predict_next(input)
+  if not predicted then return end
+  if prefetch_state.pinyin == predicted then return end
+  if prefetch_state.pinyin == input then
+    -- The guess was correct; the lookup below will consume it.
+    prefetch_state.pinyin = ""
+    prefetch_state.keys = {}
+    return
+  end
+  manager.cancel_keys(prefetch_state.keys)
+  prefetch_state.pinyin = predicted
+  prefetch_state.keys = manager.prefetch(predicted, cfg, { "baidu" })
+  log.log(cfg, "prefetch %s -> %s", input, predicted)
+end
 
 local function cfg_of(env)
   if M.cfg then return M.cfg end
@@ -72,6 +101,7 @@ local function main_info(input, seg, env, cfg)
             info.comment = comment
             info.cand_text = cand.text
             info.cand_quality = cand.quality
+            info.initials = util.comment_initials(comment)
             if #py > 0 then
               info.pinyin = py
               if cfg.pinyin_mode == "hints" or cfg.pinyin_mode == "auto" then
@@ -146,6 +176,7 @@ M.processor = { init = proc_init, func = proc_func }
 
 local function trans_init(env)
   M.cfg = config.load(env)
+  if M.cfg.warmup then manager.warmup(M.cfg) end
   log.log(M.cfg, "rime-cloud init: http_c=%s curl=%s err=%s", tostring(http.using_c),
           tostring(http.curl_version or "fallback"), tostring(http.load_error))
 end
@@ -172,6 +203,28 @@ local function trans_func(input, seg, env)
   end
   if not manual and not cfg.auto_hotword then return end
 
+  -- Fast path for incomplete pinyin prefixes in raw/full-pinyin mode: there
+  -- is nothing to display yet, so skip the extra script_translator query and
+  -- only issue a speculative prefetch.  This removes the main per-keystroke
+  -- dictionary overhead (often 5-20 ms) for prefixes such as "waliku".
+  local pre_terminal, pre_segmented, pre_extendable = syllables.classify(letters)
+  local pre_abbrev = (not pre_segmented) and (not pre_extendable) and #letters >= 4
+  if not manual and not cfg.auto_known and cfg.pinyin_mode == "raw" and
+      (not pre_segmented) and (not pre_abbrev) then
+    if cfg.prefetch then
+      local predicted = syllables.predict_next(letters)
+      if predicted then
+        speculative_prefetch(letters, cfg)
+      elseif #letters >= 3 then
+        -- No one-letter prediction (e.g. an abbreviation at 3 letters).
+        -- Still warm the Baidu lane so the final keystroke does not pay for
+        -- a TLS handshake.
+        manager.prefetch(letters, cfg, { "baidu" })
+      end
+    end
+    return
+  end
+
   local info = main_info(input, seg, env, cfg)
   local pinyin = sanitize_pinyin(letters, info.pinyin, cfg)
   if not pinyin or pinyin == "" then return end
@@ -179,13 +232,42 @@ local function trans_func(input, seg, env)
 
   local wait_ms = 0
   local quality = tonumber(info.cand_quality) or 0
-  local weak = quality < (cfg.weak_quality or 1.5)
+  local weak = quality < (cfg.weak_quality or 1.8)
+
+  local tnow = http.now_ms()
+  local st = wait_state
+  if #letters < #st.input or letters:sub(1, #st.input) ~= st.input or
+      tnow - st.last_ms > 5000 then
+    st.count = 0
+    st.last_wait_input = ""
+  end
+  st.input = letters
+  st.last_ms = tnow
+
+  -- Only block on a likely word boundary: a terminal pinyin syllable
+  -- ("walikun", "yanglikun") or an abbreviation ("nsdd").  Mid-syllable
+  -- prefixes ("walik") are answered asynchronously so typing never stalls
+  -- for them.
+  local terminal, segmented, extendable = syllables.classify(pinyin)
+  local abbreviation = (not segmented) and (not extendable) and #pinyin >= 4
+  local boundary = terminal or abbreviation
+  -- If the local dictionary already contains a phrase whose initials match
+  -- the abbreviation (nsdd -> 你说得对 / ni shuo de dui), cloud completion
+  -- would only duplicate it.  Don't block on it; use Ctrl+t to ask anyway.
+  local abbrev_covered = abbreviation and info.initials == letters
+
+  if not manual and cfg.prefetch and weak and not boundary and
+      #pinyin >= (cfg.wait_min_length or 4) then
+    speculative_prefetch(pinyin, cfg)
+  end
+
   if manual then
     wait_ms = cfg.manual_wait_ms
-  elseif weak and #letters >= (cfg.wait_min_length or 4) then
-    -- New word / name / nonsense local match: wait a short bounded time so
-    -- the cloud hint appears together with the local candidates.
+  elseif weak and boundary and not abbrev_covered and #pinyin >= (cfg.wait_min_length or 4) and
+      st.count < (cfg.max_auto_waits or 2) and st.last_wait_input ~= letters then
     wait_ms = cfg.auto_wait_ms
+    st.count = st.count + 1
+    st.last_wait_input = letters
   end
 
   -- Strong local match: don't spend network requests (or latency) on every
@@ -210,8 +292,9 @@ local function trans_func(input, seg, env)
     end
   end
 
-  log.log(cfg, "query input=%s pinyin=%s exact=%s weak=%s manual=%s wait=%d ms=%d results=%d emitted=%d cand=%s comment=%s q=%s",
-          input, pinyin, tostring(info.exact), tostring(weak), tostring(manual), wait_ms, elapsed,
+  log.log(cfg, "query input=%s pinyin=%s exact=%s weak=%s boundary=%s manual=%s wait=%d waits=%d/%d ms=%d results=%d emitted=%d cand=%s comment=%s q=%s",
+          input, pinyin, tostring(info.exact), tostring(weak), tostring(boundary),
+          tostring(manual), wait_ms, st.count, cfg.max_auto_waits or 2, elapsed,
           #results, emitted, tostring(info.cand_text), tostring(info.comment),
           tostring(info.cand_quality))
 end

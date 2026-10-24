@@ -33,7 +33,7 @@ rime_deployer --build "$WORK" /usr/share/rime-data
 cc -O2 -o "$ROOT/tests/rime_dump" "$ROOT/tests/rime_dump.c" -lrime
 
 run_keys() {
-  timeout 60 env RIME_USER_DIR="$WORK" "$ROOT/tests/rime_dump" rime_ice "$1" 2>/dev/null
+  timeout 60 env RIME_USER_DIR="$WORK" "$ROOT/tests/rime_dump" rime_ice "$1" 120 2>/dev/null
 }
 
 fail=0
@@ -55,9 +55,9 @@ check_cloud() {
 # hot-word hint should be promoted.
 check_cloud "walikun" "🔥" "automatic hot-word hint (walikun)"
 
-# nsdd: local candidates are full-pinyin lookalikes; the cloud completion
-# (你说的对) is an abbreviation expansion.
-check_cloud "nsdd" "✨" "automatic completion hint (nsdd)"
+# qwer: the local dictionary only has a near-miss (气味儿); the cloud
+# expansion (曲蔚然/犬瘟热) exercises the automatic completion path.
+check_cloud "qwer" "✨" "automatic completion hint (qwer)"
 
 # Manual trigger must place cloud candidates first.
 out="$(run_keys 'nsdd|')"

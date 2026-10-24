@@ -19,6 +19,7 @@ function M.build(pinyin, cfg)
     method = "GET",
     url = cfg.baidu_url .. util.url_encode(pinyin),
     timeout_ms = cfg.timeout_ms,
+    lane = 0,
     headers = { "Accept: application/json" },
   }
 end

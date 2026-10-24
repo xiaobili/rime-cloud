@@ -56,6 +56,25 @@ function M.comment_to_pinyin(comment)
   return table.concat(out)
 end
 
+-- Initials of a Rime spelling hint, e.g. "ni shuo de dui" -> "nsdd".
+function M.comment_initials(comment)
+  local out = {}
+  for chunk in (comment or ""):gmatch("%S+") do
+    local py = chunk:match("^([^;]+)") or ""
+    for _, uchar in ipairs(M.utf8_chars(py)) do
+      local mapped = tone_map[uchar]
+      if mapped then
+        out[#out + 1] = mapped
+        break
+      elseif uchar:match("^[A-Za-z]$") then
+        out[#out + 1] = uchar:lower()
+        break
+      end
+    end
+  end
+  return table.concat(out)
+end
+
 function M.utf8_chars(s)
   local out = {}
   for uchar in (s or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
