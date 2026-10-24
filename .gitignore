@@ -1,0 +1,10 @@
+build/
+dist/
+lua/cloud_input/cloud_http.so
+testdata/
+research/
+tests/rime_dump
+tests/*.core
+tests/out_*.txt
+cloud_debug.log
+*.bak

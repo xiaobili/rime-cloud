@@ -1,0 +1,15 @@
+package.cpath = "./lua/?.so;./lua/?/?.so;" .. package.cpath
+local http = require("cloud_input.cloud_http")
+print("version", http.version, http.curl_version)
+local t0 = os.clock()
+local body, code = http.request{url="https://olimenew.baidu.com/py?input=nihao&inputtype=py&resultcoding=utf-8", timeout_ms=800}
+print("baidu sync", code, body and #body, os.clock()-t0)
+print(body and body:sub(1,120))
+t0 = os.clock()
+local rc = http.submit("baidu|wangan", {url="https://olimenew.baidu.com/py?input=wangan&inputtype=py&resultcoding=utf-8", timeout_ms=800})
+print("submit", rc, os.clock()-t0)
+t0 = os.clock()
+local b2, c2 = http.wait("baidu|wangan", 1000)
+print("wait", c2, b2 and #b2, os.clock()-t0)
+print(b2 and b2:sub(1,120))
+print("stats", http.stats().queue, http.stats().results)
